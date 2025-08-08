@@ -1,125 +1,139 @@
-"""
-Controle com os Olhos — Versão melhorada
-
-O que eu alterei:
-- Melhor precisão: uso da média dos pontos da íris (vários landmarks) para calcular o centro do olhar
-  e normalização pelo contorno do olho. Melhorei também o "smoothing" para resposta mais estável.
-- Removi o botão/calibração (pedido: sem botão calibrar).
-- Piscar detectado por EAR (Eye Aspect Ratio). Ao detectar um piscar, a bolinha fica VERMELHA por 10s
-  e depois volta para AZUL.
-- Pequenas mensagens de debug (EAR) e desenho do contorno/íris para ajudar na depuração.
-
-Dependências: opencv, mediapipe, numpy
-Instalação: pip install opencv-python mediapipe numpy
-
-Pressione ESC para sair.
-"""
-
-import time
-import math
 import cv2
 import mediapipe as mp
 import numpy as np
+import time
 
-# Inicializa MediaPipe Face Mesh
+class Calibration:
+    def __init__(self, nb_frames=20):
+        self.nb_frames = nb_frames
+        self.thresholds_left = []
+        self.thresholds_right = []
+
+    def is_complete(self):
+        return len(self.thresholds_left) >= self.nb_frames and len(self.thresholds_right) >= self.nb_frames
+
+    def get_threshold(self, side):
+        if side == 0 and self.thresholds_left:
+            return int(np.mean(self.thresholds_left))
+        elif side == 1 and self.thresholds_right:
+            return int(np.mean(self.thresholds_right))
+        else:
+            return 50  # valor default razoável
+
+    @staticmethod
+    def iris_size(bin_img):
+        crop = bin_img[5:-5, 5:-5]
+        total_pixels = crop.size
+        black_pixels = total_pixels - cv2.countNonZero(crop)
+        return black_pixels / total_pixels
+
+    @staticmethod
+    def binarize_eye(eye_frame, threshold):
+        gray = cv2.cvtColor(eye_frame, cv2.COLOR_BGR2GRAY)
+        _, bin_img = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+        return bin_img
+
+    def find_best_threshold(self, eye_frame):
+        average_iris_size = 0.48
+        candidates = {}
+        for t in range(5, 100, 5):
+            bin_img = self.binarize_eye(eye_frame, t)
+            size = self.iris_size(bin_img)
+            candidates[t] = abs(size - average_iris_size)
+        best_thresh = min(candidates, key=candidates.get)
+        return best_thresh
+
+    def evaluate(self, eye_frame, side):
+        best_thresh = self.find_best_threshold(eye_frame)
+        if side == 0:
+            self.thresholds_left.append(best_thresh)
+            if len(self.thresholds_left) > self.nb_frames:
+                self.thresholds_left.pop(0)
+        elif side == 1:
+            self.thresholds_right.append(best_thresh)
+            if len(self.thresholds_right) > self.nb_frames:
+                self.thresholds_right.pop(0)
+
+# Configuração MediaPipe
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False,
-                                 max_num_faces=1,
-                                 refine_landmarks=True,
-                                 min_detection_confidence=0.5,
-                                 min_tracking_confidence=0.5)
+                                  max_num_faces=1,
+                                  refine_landmarks=True,
+                                  min_detection_confidence=0.5,
+                                  min_tracking_confidence=0.5)
 
-# Constantes da tela
-WIDTH, HEIGHT = 1366, 768  # Ajuste conforme necessário
-BUTTON_WIDTH, BUTTON_HEIGHT = 200, 50
-
-# Webcam
+WIDTH, HEIGHT = 1366, 768
 cap = cv2.VideoCapture(0)
 cap.set(3, WIDTH)
 cap.set(4, HEIGHT)
 
-# Posição da bolinha
 ball_x, ball_y = WIDTH // 2, HEIGHT // 2
-smoothing_factor = 0.12  # menor -> mais responsivo; maior -> mais suave
-active_eye = 0  # 0 = esquerdo, 1 = direito
+smoothing_factor = 0.15
+active_eye = 0
 
-# Índices landmarks (MediaPipe Face Mesh)
 LEFT_IRIS = [468, 469, 470, 471, 472]
 RIGHT_IRIS = [473, 474, 475, 476, 477]
-# Conjunto de 6 pontos usados para EAR (índices comumente usados no Face Mesh)
-LEFT_EYE_EAR = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE_EAR = [362, 385, 387, 263, 373, 380]
-# Usaremos também um contorno mais amplo para normalização (pode ser ajustado)
-LEFT_EYE_BORDER = [33, 133, 159, 145, 153, 154, 155, 133]
-RIGHT_EYE_BORDER = [362, 263, 386, 374, 380, 381, 382, 263]
+LEFT_EYE_BORDER = [33, 133, 159, 145, 153, 154]
+RIGHT_EYE_BORDER = [362, 263, 386, 374, 380, 381]
 
-# Blink detection
-EAR_THRESHOLD = 0.23
-EAR_CONSEC_FRAMES = 3
+LEFT_EYE_EAR_POINTS = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_EAR_POINTS = [362, 385, 387, 263, 373, 380]
+EAR_THRESHOLD = 0.25
+EAR_CONSEC_FRAMES = 2
+
 blink_counter = 0
-blink_end_time = 0.0
+blink_detected = False
+red_start_time = 0
+red_duration = 10
 
-# Mouse / UI
-mouse_x, mouse_y = 0, 0
-mouse_clicked = False
+sensitivity = 1.3
 
-# Função para desenhar botão moderno
+calibration = Calibration(nb_frames=20)
+
 def draw_button(frame, text, position, is_active):
     x, y = position
     color_bg = (0, 200, 0) if is_active else (60, 60, 60)
     color_border = (255, 255, 255)
-
-    cv2.rectangle(frame, (x, y), (x + BUTTON_WIDTH, y + BUTTON_HEIGHT), color_bg, -1, cv2.LINE_AA)
-    cv2.rectangle(frame, (x, y), (x + BUTTON_WIDTH, y + BUTTON_HEIGHT), color_border, 2, cv2.LINE_AA)
-
+    cv2.rectangle(frame, (x, y), (x + 200, y + 50), color_bg, -1, cv2.LINE_AA)
+    cv2.rectangle(frame, (x, y), (x + 200, y + 50), color_border, 2, cv2.LINE_AA)
     text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-    text_x = x + (BUTTON_WIDTH - text_size[0]) // 2
-    text_y = y + (BUTTON_HEIGHT + text_size[1]) // 2
+    text_x = x + (200 - text_size[0]) // 2
+    text_y = y + (50 + text_size[1]) // 2
     cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-# Detecta clique no botão
-def check_button_click(mouse_x, mouse_y, button_pos):
-    x, y = button_pos
-    return x <= mouse_x <= x + BUTTON_WIDTH and y <= mouse_y <= y + BUTTON_HEIGHT
+def get_eye_direction(norm_x, norm_y):
+    center_x, center_y = 0.5, 0.5
+    dx = norm_x - center_x
+    dy = center_y - norm_y
+    angle = np.degrees(np.arctan2(dy, dx))
+    if angle < 0:
+        angle += 360
+    if 337.5 <= angle or angle < 22.5:
+        return "Leste"
+    elif 22.5 <= angle < 67.5:
+        return "Nordeste"
+    elif 67.5 <= angle < 112.5:
+        return "Norte"
+    elif 112.5 <= angle < 157.5:
+        return "Noroeste"
+    elif 157.5 <= angle < 202.5:
+        return "Oeste"
+    elif 202.5 <= angle < 247.5:
+        return "Sudoeste"
+    elif 247.5 <= angle < 292.5:
+        return "Sul"
+    elif 292.5 <= angle < 337.5:
+        return "Sudeste"
 
-# Callback do mouse (somente para trocar olho ativo)
-def mouse_callback(event, x, y, flags, param):
-    global mouse_x, mouse_y, mouse_clicked
-    mouse_x, mouse_y = x, y
-    if event == cv2.EVENT_LBUTTONDOWN:
-        mouse_clicked = True
-
-cv2.namedWindow("Controle com os Olhos", cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty("Controle com os Olhos", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-cv2.setMouseCallback("Controle com os Olhos", mouse_callback)
-
-# Calcula EAR a partir de 6 landmarks
-def calculate_EAR(landmarks, eye_indices, w, h):
-    # p1..p6 conforme fórmula EAR
-    coords = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in eye_indices]
-    p1 = np.array(coords[0])
-    p2 = np.array(coords[1])
-    p3 = np.array(coords[2])
-    p4 = np.array(coords[3])
-    p5 = np.array(coords[4])
-    p6 = np.array(coords[5])
-
-    # Distâncias
-    vert1 = np.linalg.norm(p2 - p6)
-    vert2 = np.linalg.norm(p3 - p5)
-    hor = np.linalg.norm(p1 - p4)
-
-    if hor == 0:
-        return 1.0
-    ear = (vert1 + vert2) / (2.0 * hor)
+def eye_aspect_ratio(landmarks, eye_points, frame_w, frame_h):
+    def euclid_dist(p1, p2):
+        return np.linalg.norm(np.array([p1.x * frame_w, p1.y * frame_h]) - np.array([p2.x * frame_w, p2.y * frame_h]))
+    p = [landmarks[i] for i in eye_points]
+    A = euclid_dist(p[1], p[5])
+    B = euclid_dist(p[2], p[4])
+    C = euclid_dist(p[0], p[3])
+    ear = (A + B) / (2.0 * C)
     return ear
-
-# Função para obter centro da íris pela média dos pontos
-def iris_center(landmarks, iris_indices, w, h):
-    pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in iris_indices]
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    return int(np.mean(xs)), int(np.mean(ys))
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -127,102 +141,116 @@ while cap.isOpened():
         break
 
     frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb_frame)
 
-    # Botões centralizados no topo (somente dois: olho esquerdo/direito)
     draw_button(frame, "Olho Esquerdo", (WIDTH // 2 - 220, 20), active_eye == 0)
     draw_button(frame, "Olho Direito", (WIDTH // 2 + 20, 20), active_eye == 1)
 
-    # Detecta clique do mouse para trocar olho ativo
-    if mouse_clicked:
-        if check_button_click(mouse_x, mouse_y, (WIDTH // 2 - 220, 20)):
-            active_eye = 0
-        elif check_button_click(mouse_x, mouse_y, (WIDTH // 2 + 20, 20)):
-            active_eye = 1
-        mouse_clicked = False
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:
+        break
+    elif key == ord('1'):
+        active_eye = 0
+    elif key == ord('2'):
+        active_eye = 1
 
-    ball_color = (255, 0, 0)  # azul por padrão (BGR)
+    direction = "Desconhecida"
+    ear = 0.0
 
     if results.multi_face_landmarks:
         face_landmarks = results.multi_face_landmarks[0]
-        h, w, _ = frame.shape
 
-        # Calcula centros das íris (média dos pontos disponíveis)
-        left_iris_cx, left_iris_cy = iris_center(face_landmarks.landmark, LEFT_IRIS, w, h)
-        right_iris_cx, right_iris_cy = iris_center(face_landmarks.landmark, RIGHT_IRIS, w, h)
-
-        # Escolhe o olho ativo para controlar a bolinha
         if active_eye == 0:
-            iris_x, iris_y = left_iris_cx, left_iris_cy
-            eye_border_indices = LEFT_EYE_BORDER
+            iris_landmarks = [face_landmarks.landmark[i] for i in LEFT_IRIS]
+            eye_border = [face_landmarks.landmark[i] for i in LEFT_EYE_BORDER]
+            ear = eye_aspect_ratio(face_landmarks.landmark, LEFT_EYE_EAR_POINTS, w, h)
         else:
-            iris_x, iris_y = right_iris_cx, right_iris_cy
-            eye_border_indices = RIGHT_EYE_BORDER
+            iris_landmarks = [face_landmarks.landmark[i] for i in RIGHT_IRIS]
+            eye_border = [face_landmarks.landmark[i] for i in RIGHT_EYE_BORDER]
+            ear = eye_aspect_ratio(face_landmarks.landmark, RIGHT_EYE_EAR_POINTS, w, h)
 
-        # Contorno do olho usado para normalização
-        eye_pts = [(int(face_landmarks.landmark[i].x * w), int(face_landmarks.landmark[i].y * h)) for i in eye_border_indices]
-        eye_min_x = min([p[0] for p in eye_pts])
-        eye_max_x = max([p[0] for p in eye_pts])
-        eye_min_y = min([p[1] for p in eye_pts])
-        eye_max_y = max([p[1] for p in eye_pts])
+        iris_x = np.mean([p.x for p in iris_landmarks])
+        iris_y = np.mean([p.y for p in iris_landmarks])
 
-        # Proteção contra divisão por zero
-        denom_x = (eye_max_x - eye_min_x) if (eye_max_x - eye_min_x) != 0 else 1
-        denom_y = (eye_max_y - eye_min_y) if (eye_max_y - eye_min_y) != 0 else 1
+        eye_min_x = min([p.x for p in eye_border])
+        eye_max_x = max([p.x for p in eye_border])
+        eye_min_y = min([p.y for p in eye_border])
+        eye_max_y = max([p.y for p in eye_border])
 
-        norm_x = (iris_x - eye_min_x) / denom_x
-        norm_y = (iris_y - eye_min_y) / denom_y
+        # Normaliza posição íris no olho
+        norm_x = (iris_x - eye_min_x) / (eye_max_x - eye_min_x)
+        norm_y = (iris_y - eye_min_y) / (eye_max_y - eye_min_y)
+        norm_y = 1 - norm_y
 
-        # Aplica alguma sensibilidade (ajuste aqui se quiser mais alcance)
-        sens_x = 1.0
-        sens_y = 1.0
+        # Recorta região do olho para calibração
+        # Converte landmarks para pixels
+        min_x_px = int(eye_min_x * w)
+        max_x_px = int(eye_max_x * w)
+        min_y_px = int(eye_min_y * h)
+        max_y_px = int(eye_max_y * h)
 
-        target_x = int(np.clip(norm_x * WIDTH * sens_x, 0, WIDTH))
-        target_y = int(np.clip(norm_y * HEIGHT * sens_y, 0, HEIGHT))
+        # Evita erros se região inválida
+        if max_x_px - min_x_px > 10 and max_y_px - min_y_px > 10:
+            eye_crop = frame[min_y_px:max_y_px, min_x_px:max_x_px]
+            # Avalia calibração no olho ativo
+            calibration.evaluate(eye_crop, active_eye)
 
-        # Suaviza movimento
+        direction = get_eye_direction(norm_x, norm_y)
+
+        # Aplica sensibilidade e suavização
+        target_x = int(norm_x * WIDTH * sensitivity)
+        target_y = int(norm_y * HEIGHT * sensitivity)
+        target_x = np.clip(target_x, 0, WIDTH)
+        target_y = np.clip(target_y, 0, HEIGHT)
+
         ball_x = int(ball_x * (1 - smoothing_factor) + target_x * smoothing_factor)
         ball_y = int(ball_y * (1 - smoothing_factor) + target_y * smoothing_factor)
 
-        # Desenhos auxiliares
-        cv2.circle(frame, (iris_x, iris_y), 3, (0, 255, 255), -1)
-        for p in eye_pts:
-            cv2.circle(frame, p, 1, (200, 200, 200), -1)
-
-        # DETECÇÃO DE PISCAR (EAR)
-        left_ear = calculate_EAR(face_landmarks.landmark, LEFT_EYE_EAR, w, h)
-        right_ear = calculate_EAR(face_landmarks.landmark, RIGHT_EYE_EAR, w, h)
-        avg_ear = (left_ear + right_ear) / 2.0
-
-        # Debug: mostra EAR
-        cv2.putText(frame, f"EAR: {avg_ear:.2f}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-
-        # Contador de frames consecutivos com EAR baixo
-        if avg_ear < EAR_THRESHOLD:
+        # Detecta piscar via EAR
+        if ear < EAR_THRESHOLD:
             blink_counter += 1
         else:
             if blink_counter >= EAR_CONSEC_FRAMES:
-                # Piscar detectado -> ativa vermelho por 10 segundos
-                blink_end_time = time.time() + 10.0
+                blink_detected = True
+                red_start_time = time.time()
             blink_counter = 0
 
-        # Se dentro do período de vermelho, altera cor
-        if time.time() < blink_end_time:
-            ball_color = (0, 0, 255)  # VERMELHO
-            cv2.putText(frame, "PISCAR: VERMELHO (tempo restante: {:.0f}s)".format(max(0, blink_end_time - time.time())),
-                        (50, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    # Bola com cor muda ao piscar
+    if blink_detected:
+        elapsed = time.time() - red_start_time
+        if elapsed < red_duration:
+            color = (0, 0, 255)
+        else:
+            color = (255, 0, 0)
+            blink_detected = False
+    else:
+        color = (255, 0, 0)
 
-    # Desenha a bolinha (usa a cor determinada acima)
-    ball_x = int(np.clip(ball_x, 0, WIDTH))
-    ball_y = int(np.clip(ball_y, 0, HEIGHT))
-    cv2.circle(frame, (ball_x, ball_y), 20, ball_color, -1)
+    cv2.circle(frame, (ball_x, ball_y), 20, color, -1)
+    cv2.putText(frame, f"Olho ativo: {'Esquerdo' if active_eye == 0 else 'Direito'}", (30, HEIGHT - 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    if results.multi_face_landmarks:
+        cv2.putText(frame, f"EAR: {ear:.2f}", (30, HEIGHT - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # Exibe direção
+    cv2.putText(frame, f"Direcao: {direction}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                1, (0, 255, 0), 2)
+
+    # Indicação de calibração
+    if calibration.is_complete():
+        thresh = calibration.get_threshold(active_eye)
+        cv2.putText(frame, f"Threshold calibrado: {thresh}", (30, HEIGHT - 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    else:
+        cv2.putText(frame, "Calibrando...", (30, HEIGHT - 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    cv2.putText(frame, "Pressione 1 para Olho Esquerdo | 2 para Olho Direito | ESC para sair", (30, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
     cv2.imshow("Controle com os Olhos", frame)
-
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27:  # ESC
-        break
 
 cap.release()
 cv2.destroyAllWindows()
