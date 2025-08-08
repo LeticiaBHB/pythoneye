@@ -2,7 +2,6 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from sklearn.linear_model import LinearRegression
-import time
 
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False,
@@ -16,7 +15,6 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
 
-# Landmarks para íris e borda olho esquerdo e direito
 LEFT_IRIS = [468, 469, 470, 471, 472]
 LEFT_EYE_BORDER = [33, 133, 159, 145, 153, 154]
 
@@ -32,22 +30,15 @@ model = LinearRegression()
 active_eye = 0  # 0 = olho esquerdo, 1 = olho direito
 landmarks_for_calib = None
 
-# Posições na tela para calibração (grade 3x3)
-calib_points = [
-    (WIDTH * 0.1, HEIGHT * 0.1),
-    (WIDTH * 0.5, HEIGHT * 0.1),
-    (WIDTH * 0.9, HEIGHT * 0.1),
-    (WIDTH * 0.1, HEIGHT * 0.5),
-    (WIDTH * 0.5, HEIGHT * 0.5),
-    (WIDTH * 0.9, HEIGHT * 0.5),
-    (WIDTH * 0.1, HEIGHT * 0.9),
-    (WIDTH * 0.5, HEIGHT * 0.9),
-    (WIDTH * 0.9, HEIGHT * 0.9),
-]
+# GRADE 5x5 para mais pontos, mais precisão
+grid_x = np.linspace(0.1, 0.9, 5)
+grid_y = np.linspace(0.1, 0.9, 5)
+calib_points = [(x * WIDTH, y * HEIGHT) for y in grid_y for x in grid_x]
 
 calib_idx = 0
-frames_per_point = 30  # Quantidade de frames para coleta por ponto
+frames_per_point = 50  # Mais frames para maior média
 frame_count = 0
+temp_features = []
 
 
 def extract_eye_features(landmarks, iris_idxs, eye_border_idxs):
@@ -62,10 +53,21 @@ def extract_eye_features(landmarks, iris_idxs, eye_border_idxs):
     min_y = min([p.y for p in eye_border_points])
     max_y = max([p.y for p in eye_border_points])
 
-    norm_x = (iris_x - min_x) / (max_x - min_x)
-    norm_y = (iris_y - min_y) / (max_y - min_y)
+    # Normalização melhor: evitar divisão por zero
+    norm_x = (iris_x - min_x) / (max_x - min_x) if (max_x - min_x) != 0 else 0
+    norm_y = (iris_y - min_y) / (max_y - min_y) if (max_y - min_y) != 0 else 0
 
-    return [norm_x, norm_y]
+    # Distâncias relativas dentro do olho para mais robustez
+    width = max_x - min_x
+    height = max_y - min_y
+
+    # Distância da íris ao centro do olho (normalizado)
+    center_x = (min_x + max_x) / 2
+    center_y = (min_y + max_y) / 2
+    dist_x = (iris_x - center_x) / width if width != 0 else 0
+    dist_y = (iris_y - center_y) / height if height != 0 else 0
+
+    return [norm_x, norm_y, dist_x, dist_y]
 
 
 def draw_button(frame, text, position, active):
@@ -84,23 +86,18 @@ def draw_calib_point(frame, pos):
 def on_mouse(event, x, y, flags, param):
     global active_eye
     if event == cv2.EVENT_LBUTTONDOWN:
-        # Botão olho esquerdo
         if WIDTH // 2 - 220 <= x <= WIDTH // 2 - 220 + 180 and 20 <= y <= 60:
             active_eye = 0
             print("Olho esquerdo selecionado")
-            return
-        # Botão olho direito
-        if WIDTH // 2 + 20 <= x <= WIDTH // 2 + 20 + 180 and 20 <= y <= 60:
+        elif WIDTH // 2 + 20 <= x <= WIDTH // 2 + 20 + 180 and 20 <= y <= 60:
             active_eye = 1
             print("Olho direito selecionado")
-            return
 
 
 cv2.namedWindow("Gaze Calibration")
 cv2.setMouseCallback("Gaze Calibration", on_mouse)
 
 calibrating = False
-calib_start_time = None
 
 print("Pressione 'c' para iniciar calibração automática")
 print("Pressione 'q' para sair")
@@ -138,12 +135,10 @@ while True:
     else:
         landmarks_for_calib = None
 
-    # Desenha botões olho esquerdo/direito
     draw_button(frame, "Olho Esquerdo", (WIDTH // 2 - 220, 20), active_eye == 0)
     draw_button(frame, "Olho Direito", (WIDTH // 2 + 20, 20), active_eye == 1)
 
     if calibrating:
-        # Mostra ponto de calibração atual
         point = calib_points[calib_idx]
         draw_calib_point(frame, point)
         cv2.putText(frame, f"Olhe para o ponto {calib_idx + 1}/{len(calib_points)}",
@@ -151,7 +146,6 @@ while True:
 
         if landmarks_for_calib is not None:
             frame_count += 1
-            # Coleta features durante frames_per_point frames e faz média
             if frame_count == 1:
                 temp_features = []
 
@@ -162,11 +156,17 @@ while True:
                     f = extract_eye_features(landmarks_for_calib, RIGHT_IRIS, RIGHT_EYE_BORDER)
                 temp_features.append(f)
             else:
-                # Média das features do ponto
-                mean_features = np.mean(temp_features, axis=0).tolist()
-                calib_features.append(mean_features)
-                calib_targets.append([point[0] / WIDTH, point[1] / HEIGHT])
-                print(f"Calibrado ponto {calib_idx + 1} com features {mean_features}")
+                # Mediana para eliminar outliers
+                median_features = np.median(temp_features, axis=0).tolist()
+
+                # Verificação simples de estabilidade (desvio)
+                std_dev = np.std(temp_features, axis=0)
+                if np.any(std_dev > 0.05):  # limiar, ajustar se quiser
+                    print(f"Aviso: alta variação nas amostras do ponto {calib_idx + 1}, descartando")
+                else:
+                    calib_features.append(median_features)
+                    calib_targets.append([point[0] / WIDTH, point[1] / HEIGHT])
+                    print(f"Calibrado ponto {calib_idx + 1} com features {median_features}")
 
                 calib_idx += 1
                 frame_count = 0
@@ -175,18 +175,17 @@ while True:
                 if calib_idx >= len(calib_points):
                     calibrating = False
                     calib_idx = 0
-                    # Treina o modelo automaticamente
                     print("Treinando modelo com dados calibrados...")
                     X = np.array(calib_features)
                     y = np.array(calib_targets)
                     model.fit(X, y)
                     model_trained = True
                     print("Modelo treinado com sucesso!")
+
     else:
         cv2.putText(frame, "Pressione 'c' para iniciar calibração automática",
                     (20, HEIGHT - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    # Textos úteis
     cv2.putText(frame, f"Olho ativo: {'Esquerdo' if active_eye == 0 else 'Direito'}",
                 (WIDTH - 300, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
@@ -196,7 +195,6 @@ while True:
     if key == ord('q'):
         break
     elif key == ord('c') and not calibrating:
-        # Reseta calibração e inicia processo
         calib_features = []
         calib_targets = []
         calib_idx = 0
