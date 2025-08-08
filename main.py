@@ -15,11 +15,13 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
 
-LEFT_IRIS = [468, 469, 470, 471, 472]
-LEFT_EYE_BORDER = [33, 133, 159, 145, 153, 154]
+# Índices expandidos da íris e pupila para olho esquerdo
+LEFT_IRIS = [468, 469, 470, 471, 472, 474, 475, 476, 477]
+LEFT_EYE_BORDER = [33, 133, 159, 145, 153, 154, 155, 153, 144, 163, 7, 246, 161, 160]
 
-RIGHT_IRIS = [473, 474, 475, 476, 477]
-RIGHT_EYE_BORDER = [263, 362, 386, 374, 380, 381]
+# Índices expandidos da íris e pupila para olho direito
+RIGHT_IRIS = [473, 474, 475, 476, 477, 469, 470, 471, 472]
+RIGHT_EYE_BORDER = [263, 362, 386, 374, 380, 381, 382, 380, 373, 390, 249, 466, 388, 387]
 
 calib_features = []
 calib_targets = []
@@ -27,48 +29,73 @@ calib_targets = []
 model_trained = False
 model = LinearRegression()
 
-active_eye = 0  # 0 = olho esquerdo, 1 = olho direito
+active_eye = 0  # 0 = olho esquerdo, 1 = olho direito, 2 = ambos olhos
 landmarks_for_calib = None
 
-# GRADE 5x5 para mais pontos, mais precisão
+# Grade 5x5 para calibração
 grid_x = np.linspace(0.1, 0.9, 5)
 grid_y = np.linspace(0.1, 0.9, 5)
 calib_points = [(x * WIDTH, y * HEIGHT) for y in grid_y for x in grid_x]
 
 calib_idx = 0
-frames_per_point = 50  # Mais frames para maior média
+frames_per_point = 50
 frame_count = 0
 temp_features = []
-
 
 def extract_eye_features(landmarks, iris_idxs, eye_border_idxs):
     iris_points = [landmarks[i] for i in iris_idxs]
     eye_border_points = [landmarks[i] for i in eye_border_idxs]
 
-    iris_x = np.mean([p.x for p in iris_points])
-    iris_y = np.mean([p.y for p in iris_points])
+    iris_xs = np.array([p.x for p in iris_points])
+    iris_ys = np.array([p.y for p in iris_points])
 
-    min_x = min([p.x for p in eye_border_points])
-    max_x = max([p.x for p in eye_border_points])
-    min_y = min([p.y for p in eye_border_points])
-    max_y = max([p.y for p in eye_border_points])
+    border_xs = np.array([p.x for p in eye_border_points])
+    border_ys = np.array([p.y for p in eye_border_points])
 
-    # Normalização melhor: evitar divisão por zero
-    norm_x = (iris_x - min_x) / (max_x - min_x) if (max_x - min_x) != 0 else 0
-    norm_y = (iris_y - min_y) / (max_y - min_y) if (max_y - min_y) != 0 else 0
+    min_x, max_x = border_xs.min(), border_xs.max()
+    min_y, max_y = border_ys.min(), border_ys.max()
 
-    # Distâncias relativas dentro do olho para mais robustez
     width = max_x - min_x
     height = max_y - min_y
 
-    # Distância da íris ao centro do olho (normalizado)
+    # Centro do olho (borda)
     center_x = (min_x + max_x) / 2
     center_y = (min_y + max_y) / 2
-    dist_x = (iris_x - center_x) / width if width != 0 else 0
-    dist_y = (iris_y - center_y) / height if height != 0 else 0
 
-    return [norm_x, norm_y, dist_x, dist_y]
+    # Média da íris
+    iris_mean_x = iris_xs.mean()
+    iris_mean_y = iris_ys.mean()
 
+    # Variância da íris
+    var_x = iris_xs.var()
+    var_y = iris_ys.var()
+
+    # Distância da íris para o centro do olho (normalizado)
+    dist_x = (iris_mean_x - center_x) / width if width > 0 else 0
+    dist_y = (iris_mean_y - center_y) / height if height > 0 else 0
+
+    # Distância média entre pontos da íris (tamanho e forma)
+    dists = []
+    for i in range(len(iris_points)):
+        for j in range(i + 1, len(iris_points)):
+            dx = iris_xs[i] - iris_xs[j]
+            dy = iris_ys[i] - iris_ys[j]
+            dists.append(np.sqrt(dx*dx + dy*dy))
+    dist_mean = np.mean(dists) if dists else 0
+    dist_std = np.std(dists) if dists else 0
+
+    features = [
+        (iris_mean_x - min_x) / width if width > 0 else 0,
+        (iris_mean_y - min_y) / height if height > 0 else 0,
+        dist_x,
+        dist_y,
+        var_x,
+        var_y,
+        dist_mean,
+        dist_std,
+    ]
+
+    return features
 
 def draw_button(frame, text, position, active):
     x, y = position
@@ -78,21 +105,21 @@ def draw_button(frame, text, position, active):
     cv2.putText(frame, text, (x + 10, y + 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
-
 def draw_calib_point(frame, pos):
     cv2.circle(frame, (int(pos[0]), int(pos[1])), 15, (0, 0, 255), -1)
-
 
 def on_mouse(event, x, y, flags, param):
     global active_eye
     if event == cv2.EVENT_LBUTTONDOWN:
-        if WIDTH // 2 - 220 <= x <= WIDTH // 2 - 220 + 180 and 20 <= y <= 60:
+        if WIDTH // 2 - 340 <= x <= WIDTH // 2 - 340 + 180 and 20 <= y <= 60:
             active_eye = 0
             print("Olho esquerdo selecionado")
-        elif WIDTH // 2 + 20 <= x <= WIDTH // 2 + 20 + 180 and 20 <= y <= 60:
+        elif WIDTH // 2 - 100 <= x <= WIDTH // 2 - 100 + 180 and 20 <= y <= 60:
             active_eye = 1
             print("Olho direito selecionado")
-
+        elif WIDTH // 2 + 140 <= x <= WIDTH // 2 + 140 + 180 and 20 <= y <= 60:
+            active_eye = 2
+            print("Ambos os olhos selecionados")
 
 cv2.namedWindow("Gaze Calibration")
 cv2.setMouseCallback("Gaze Calibration", on_mouse)
@@ -118,9 +145,17 @@ while True:
         if active_eye == 0:
             features = extract_eye_features(face_landmarks, LEFT_IRIS, LEFT_EYE_BORDER)
             iris_points = LEFT_IRIS
-        else:
+            eye_border_points = LEFT_EYE_BORDER
+        elif active_eye == 1:
             features = extract_eye_features(face_landmarks, RIGHT_IRIS, RIGHT_EYE_BORDER)
             iris_points = RIGHT_IRIS
+            eye_border_points = RIGHT_EYE_BORDER
+        else:  # Ambos os olhos
+            features_left = extract_eye_features(face_landmarks, LEFT_IRIS, LEFT_EYE_BORDER)
+            features_right = extract_eye_features(face_landmarks, RIGHT_IRIS, RIGHT_EYE_BORDER)
+            features = features_left + features_right
+            iris_points = LEFT_IRIS + RIGHT_IRIS
+            eye_border_points = LEFT_EYE_BORDER + RIGHT_EYE_BORDER
 
         if model_trained:
             pred = model.predict([features])[0]
@@ -128,15 +163,25 @@ while True:
             pred_y = int(pred[1] * HEIGHT)
             cv2.circle(frame, (pred_x, pred_y), 20, (0, 255, 0), -1)
 
+        # Desenhar pontos da íris em verde
         for idx in iris_points:
             lm = face_landmarks[idx]
             cx, cy = int(lm.x * WIDTH), int(lm.y * HEIGHT)
-            cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+            cv2.circle(frame, (cx, cy), 4, (0, 255, 0), -1)  # Verde
+
+        # Desenhar pontos da borda do olho em azul
+        for idx in eye_border_points:
+            lm = face_landmarks[idx]
+            cx, cy = int(lm.x * WIDTH), int(lm.y * HEIGHT)
+            cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)  # Azul
+
     else:
         landmarks_for_calib = None
 
-    draw_button(frame, "Olho Esquerdo", (WIDTH // 2 - 220, 20), active_eye == 0)
-    draw_button(frame, "Olho Direito", (WIDTH // 2 + 20, 20), active_eye == 1)
+    # Desenhar botões
+    draw_button(frame, "Olho Esquerdo", (WIDTH // 2 - 340, 20), active_eye == 0)
+    draw_button(frame, "Olho Direito", (WIDTH // 2 - 100, 20), active_eye == 1)
+    draw_button(frame, "Ambos os Olhos", (WIDTH // 2 + 140, 20), active_eye == 2)
 
     if calibrating:
         point = calib_points[calib_idx]
@@ -152,16 +197,17 @@ while True:
             if frame_count <= frames_per_point:
                 if active_eye == 0:
                     f = extract_eye_features(landmarks_for_calib, LEFT_IRIS, LEFT_EYE_BORDER)
-                else:
+                elif active_eye == 1:
                     f = extract_eye_features(landmarks_for_calib, RIGHT_IRIS, RIGHT_EYE_BORDER)
+                else:
+                    f_left = extract_eye_features(landmarks_for_calib, LEFT_IRIS, LEFT_EYE_BORDER)
+                    f_right = extract_eye_features(landmarks_for_calib, RIGHT_IRIS, RIGHT_EYE_BORDER)
+                    f = f_left + f_right
                 temp_features.append(f)
             else:
-                # Mediana para eliminar outliers
                 median_features = np.median(temp_features, axis=0).tolist()
-
-                # Verificação simples de estabilidade (desvio)
                 std_dev = np.std(temp_features, axis=0)
-                if np.any(std_dev > 0.05):  # limiar, ajustar se quiser
+                if np.any(std_dev > 0.05):
                     print(f"Aviso: alta variação nas amostras do ponto {calib_idx + 1}, descartando")
                 else:
                     calib_features.append(median_features)
@@ -186,7 +232,8 @@ while True:
         cv2.putText(frame, "Pressione 'c' para iniciar calibração automática",
                     (20, HEIGHT - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    cv2.putText(frame, f"Olho ativo: {'Esquerdo' if active_eye == 0 else 'Direito'}",
+    eye_text = {0: "Esquerdo", 1: "Direito", 2: "Ambos"}
+    cv2.putText(frame, f"Olho ativo: {eye_text[active_eye]}",
                 (WIDTH - 300, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
     cv2.imshow("Gaze Calibration", frame)
