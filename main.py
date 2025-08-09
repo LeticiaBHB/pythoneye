@@ -42,6 +42,10 @@ frames_per_point = 50
 frame_count = 0
 temp_features = []
 
+# Para filtro exponencial (suavização) da predição
+smoothed_pred = None
+alpha = 0.2  # Ajuste: 0 = sem suavização, 1 = só o último valor
+
 def extract_eye_features(landmarks, iris_idxs, eye_border_idxs):
     iris_points = [landmarks[i] for i in iris_idxs]
     eye_border_points = [landmarks[i] for i in eye_border_idxs]
@@ -159,9 +163,16 @@ while True:
 
         if model_trained:
             pred = model.predict([features])[0]
-            pred_x = int(pred[0] * WIDTH)
-            pred_y = int(pred[1] * HEIGHT)
-            cv2.circle(frame, (pred_x, pred_y), 20, (0, 255, 0), -1)
+            pred_x = pred[0] * WIDTH
+            pred_y = pred[1] * HEIGHT
+
+            # Aplica filtro exponencial para suavizar a predição
+            if smoothed_pred is None:
+                smoothed_pred = np.array([pred_x, pred_y])
+            else:
+                smoothed_pred = alpha * np.array([pred_x, pred_y]) + (1 - alpha) * smoothed_pred
+
+            cv2.circle(frame, (int(smoothed_pred[0]), int(smoothed_pred[1])), 20, (0, 255, 0), -1)
 
         # Desenhar pontos da íris em verde
         for idx in iris_points:
@@ -177,6 +188,7 @@ while True:
 
     else:
         landmarks_for_calib = None
+        smoothed_pred = None  # Reiniciar suavização se perder face
 
     # Desenhar botões
     draw_button(frame, "Olho Esquerdo", (WIDTH // 2 - 340, 20), active_eye == 0)
@@ -247,6 +259,7 @@ while True:
         calib_idx = 0
         frame_count = 0
         calibrating = True
+        smoothed_pred = None  # Resetar suavização ao iniciar calibração
         print("Iniciando calibração automática... Olhe para os pontos!")
 
 cap.release()
