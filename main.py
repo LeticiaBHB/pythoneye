@@ -50,11 +50,7 @@ print("- Pressione 'h' para aumentar o ganho")
 blink_start_time = None
 BLINK_DURATION = 5  # segundos
 CLICK_THRESHOLD = 0.20
-square_clicked = False
-show_square = False
-square_pos = (WIDTH - 150, HEIGHT // 2 - 50, 100, 100)
 
-# Filtro de suavização (últimos N pontos)
 smooth_queue = deque(maxlen=5)
 
 def extract_eye_features(landmarks, iris_idxs, eye_border_idxs):
@@ -141,6 +137,7 @@ while True:
     results = face_mesh.process(rgb_frame)
 
     pred_x, pred_y = None, None
+    color = (0, 255, 0)  # Cor padrão verde
 
     if results.multi_face_landmarks:
         face_landmarks = results.multi_face_landmarks[0].landmark
@@ -148,52 +145,35 @@ while True:
 
         if active_eye == 0:
             features = extract_eye_features(face_landmarks, LEFT_IRIS, LEFT_EYE_BORDER)
-            iris_points = LEFT_IRIS
-            eye_border_points = LEFT_EYE_BORDER
+            ear = eye_aspect_ratio(face_landmarks, LEFT_EYE_BORDER)
         elif active_eye == 1:
             features = extract_eye_features(face_landmarks, RIGHT_IRIS, RIGHT_EYE_BORDER)
-            iris_points = RIGHT_IRIS
-            eye_border_points = RIGHT_EYE_BORDER
+            ear = eye_aspect_ratio(face_landmarks, RIGHT_EYE_BORDER)
         else:
             features = extract_eye_features(face_landmarks, LEFT_IRIS, LEFT_EYE_BORDER) + \
                        extract_eye_features(face_landmarks, RIGHT_IRIS, RIGHT_EYE_BORDER)
-            iris_points = LEFT_IRIS + RIGHT_IRIS
-            eye_border_points = LEFT_EYE_BORDER + RIGHT_EYE_BORDER
+            ear = (eye_aspect_ratio(face_landmarks, LEFT_EYE_BORDER) +
+                   eye_aspect_ratio(face_landmarks, RIGHT_EYE_BORDER)) / 2
 
         if model_trained:
             pred = model.predict([features])[0]
             pred_x = int(pred[0] * WIDTH)
             pred_y = int(pred[1] * HEIGHT)
 
-            # Suavização para reduzir sensibilidade
             smooth_queue.append((pred_x, pred_y))
             pred_x = int(np.mean([p[0] for p in smooth_queue]))
             pred_y = int(np.mean([p[1] for p in smooth_queue]))
 
-            cv2.circle(frame, (pred_x, pred_y), 20, (0, 255, 0), -1)
+            # Lógica para mudar cor após 5s de olho fechado
+            if ear < CLICK_THRESHOLD:
+                if blink_start_time is None:
+                    blink_start_time = time.time()
+                elif time.time() - blink_start_time >= BLINK_DURATION:
+                    color = (255, 0, 0)  # Azul
+            else:
+                blink_start_time = None
 
-            if show_square:
-                sq_x, sq_y, sq_w, sq_h = square_pos
-                color = (0, 255, 0) if square_clicked else (0, 0, 255)
-                cv2.rectangle(frame, (sq_x, sq_y), (sq_x + sq_w, sq_y + sq_h), color, -1)
-
-                if active_eye == 0:
-                    ear = eye_aspect_ratio(face_landmarks, LEFT_EYE_BORDER)
-                elif active_eye == 1:
-                    ear = eye_aspect_ratio(face_landmarks, RIGHT_EYE_BORDER)
-                else:
-                    ear = (eye_aspect_ratio(face_landmarks, LEFT_EYE_BORDER) +
-                           eye_aspect_ratio(face_landmarks, RIGHT_EYE_BORDER)) / 2
-
-                if ear < CLICK_THRESHOLD:
-                    if blink_start_time is None:
-                        blink_start_time = time.time()
-                    elif time.time() - blink_start_time >= BLINK_DURATION:
-                        if sq_x <= pred_x <= sq_x + sq_w and sq_y <= pred_y <= sq_y + sq_h:
-                            square_clicked = not square_clicked
-                            blink_start_time = None
-                else:
-                    blink_start_time = None
+            cv2.circle(frame, (pred_x, pred_y), 20, color, -1)
 
     draw_button(frame, "Olho Esquerdo", (WIDTH // 2 - 340, 20), active_eye == 0)
     draw_button(frame, "Olho Direito", (WIDTH // 2 - 100, 20), active_eye == 1)
@@ -223,7 +203,6 @@ while True:
                     calibrating = False
                     model.fit(np.array(calib_features), np.array(calib_targets))
                     model_trained = True
-                    show_square = True
     else:
         if not model_trained:
             cv2.putText(frame, "Pressione 'c' para iniciar calibração",
