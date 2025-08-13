@@ -48,8 +48,9 @@ print("- Pressione 'g' para reduzir o ganho")
 print("- Pressione 'h' para aumentar o ganho")
 
 blink_start_time = None
+blinking = False
 BLINK_DURATION = 5  # segundos
-CLICK_THRESHOLD = 5.0  # Threshold ajustado para razão hor/ver
+CLICK_THRESHOLD = 5.0  # Threshold ajustado para razão horizontal/vertical
 
 smooth_queue = deque(maxlen=5)
 
@@ -174,18 +175,25 @@ while True:
             pred_x = int(np.mean([p[0] for p in smooth_queue]))
             pred_y = int(np.mean([p[1] for p in smooth_queue]))
 
-            # Lógica para detectar piscada e olho aberto e exibir texto na tela
             if blink_ratio > CLICK_THRESHOLD:
-                cv2.putText(frame, "Piscando", (50, 100),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-                if blink_start_time is None:
+                # olho piscado - pinta amarelo e inicia temporizador
+                color = (0, 255, 255)  # amarelo (BGR)
+                if not blinking:
                     blink_start_time = time.time()
-                elif time.time() - blink_start_time >= BLINK_DURATION:
-                    color = (255, 0, 0)  # Azul após 5s de olho fechado
+                    blinking = True
+                cv2.putText(frame, "Blinking Detected", (50, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
             else:
-                cv2.putText(frame, "Olhos Abertos", (50, 100),
+                # olho aberto
+                cv2.putText(frame, "Eyes Open", (50, 100),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-                blink_start_time = None
+                if blinking:
+                    # se ficou 5s aberto após piscada, volta cor verde
+                    if time.time() - blink_start_time >= BLINK_DURATION:
+                        blinking = False
+                        blink_start_time = None
+                if not blinking:
+                    color = (0, 255, 0)  # verde
 
             cv2.circle(frame, (pred_x, pred_y), 20, color, -1)
 
