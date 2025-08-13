@@ -174,13 +174,17 @@ while True:
             pred_x = int(np.mean([p[0] for p in smooth_queue]))
             pred_y = int(np.mean([p[1] for p in smooth_queue]))
 
-            # Lógica para mudar cor após 5s de olho fechado (blink_ratio alto indica olho fechado)
+            # Lógica para detectar piscada e olho aberto e exibir texto na tela
             if blink_ratio > CLICK_THRESHOLD:
+                cv2.putText(frame, "Piscando", (50, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
                 if blink_start_time is None:
                     blink_start_time = time.time()
                 elif time.time() - blink_start_time >= BLINK_DURATION:
-                    color = (255, 0, 0)  # Azul
+                    color = (255, 0, 0)  # Azul após 5s de olho fechado
             else:
+                cv2.putText(frame, "Olhos Abertos", (50, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
                 blink_start_time = None
 
             cv2.circle(frame, (pred_x, pred_y), 20, color, -1)
