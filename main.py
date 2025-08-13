@@ -21,7 +21,6 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
 
 LEFT_IRIS = [468, 469, 470, 471, 472]
 LEFT_EYE_BORDER = [33, 133, 159, 145, 153, 154, 155, 144, 163, 7, 246, 161, 160]
-
 RIGHT_IRIS = [473, 474, 475, 476, 477]
 RIGHT_EYE_BORDER = [263, 362, 386, 374, 380, 381, 382, 373, 390, 249, 466, 388, 387]
 
@@ -52,7 +51,26 @@ blinking = False
 BLINK_DURATION = 5  # segundos
 CLICK_THRESHOLD = 5.0  # Threshold ajustado para razão horizontal/vertical
 
-smooth_queue = deque(maxlen=5)
+# Filtro de Kalman
+class KalmanFilter:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+        self.kf.processNoiseCov = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32) * 0.03
+        self.kf.measurementNoiseCov = np.array([[1, 0], [0, 1]], np.float32) * 1
+        self.last_measurement = np.array((2, 1), np.float32)
+        self.last_prediction = np.array((2, 1), np.float32)
+
+    def update(self, x, y):
+        measured = np.array([[np.float32(x)], [np.float32(y)]])
+        self.kf.correct(measured)
+        predicted = self.kf.predict()
+        self.last_measurement = measured
+        self.last_prediction = predicted
+        return predicted[0][0], predicted[1][0]
+
+kf = KalmanFilter()
 
 def extract_eye_features(landmarks, iris_idxs, eye_border_idxs):
     iris_points = [landmarks[i] for i in iris_idxs]
@@ -91,20 +109,13 @@ def extract_eye_features(landmarks, iris_idxs, eye_border_idxs):
     return features
 
 def get_blinking_ratio_mediapipe(landmarks, eye_idxs):
-    # Extrai os pontos do olho como tuplas (x, y) em pixels
     eye_points = [(int(landmarks[i].x * WIDTH), int(landmarks[i].y * HEIGHT)) for i in eye_idxs]
-
     left_point = np.array(eye_points[0])
     right_point = np.array(eye_points[3])
-
-    center_top = ((eye_points[1][0] + eye_points[2][0]) / 2,
-                  (eye_points[1][1] + eye_points[2][1]) / 2)
-    center_bottom = ((eye_points[5][0] + eye_points[4][0]) / 2,
-                     (eye_points[5][1] + eye_points[4][1]) / 2)
-
+    center_top = ((eye_points[1][0] + eye_points[2][0]) / 2, (eye_points[1][1] + eye_points[2][1]) / 2)
+    center_bottom = ((eye_points[5][0] + eye_points[4][0]) / 2, (eye_points[5][1] + eye_points[4][1]) / 2)
     hor_line_length = np.linalg.norm(left_point - right_point)
     ver_line_length = np.linalg.norm(np.array(center_top) - np.array(center_bottom))
-
     ratio = hor_line_length / ver_line_length if ver_line_length != 0 else 0
     return ratio
 
@@ -113,8 +124,7 @@ def draw_button(frame, text, position, active):
     w, h = 180, 40
     color = (0, 255, 0) if active else (200, 200, 200)
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, -1)
-    cv2.putText(frame, text, (x + 10, y + 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    cv2.putText(frame, text, (x + 10, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
 def draw_calib_point(frame, pos):
     cv2.circle(frame, (int(pos[0]), int(pos[1])), 15, (0, 0, 255), -1)
@@ -146,7 +156,7 @@ while True:
     results = face_mesh.process(rgb_frame)
 
     pred_x, pred_y = None, None
-    color = (0, 255, 0)  # Cor padrão verde
+    color = (0, 255, 0)
 
     if results.multi_face_landmarks:
         face_landmarks = results.multi_face_landmarks[0].landmark
@@ -168,34 +178,26 @@ while True:
 
         if model_trained:
             pred = model.predict([features])[0]
-            pred_x = int(pred[0] * WIDTH)
-            pred_y = int(pred[1] * HEIGHT)
+            raw_x, raw_y = int(pred[0] * WIDTH), int(pred[1] * HEIGHT)
 
-            smooth_queue.append((pred_x, pred_y))
-            pred_x = int(np.mean([p[0] for p in smooth_queue]))
-            pred_y = int(np.mean([p[1] for p in smooth_queue]))
+            # Aplica Filtro de Kalman
+            pred_x, pred_y = kf.update(raw_x, raw_y)
 
             if blink_ratio > CLICK_THRESHOLD:
-                # olho piscado - pinta amarelo e inicia temporizador
-                color = (0, 255, 255)  # amarelo (BGR)
+                color = (0, 255, 255)
                 if not blinking:
                     blink_start_time = time.time()
                     blinking = True
-                cv2.putText(frame, "Blinking Detected", (50, 100),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+                cv2.putText(frame, "Blinking Detected", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
             else:
-                # olho aberto
-                cv2.putText(frame, "Eyes Open", (50, 100),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-                if blinking:
-                    # se ficou 5s aberto após piscada, volta cor verde
-                    if time.time() - blink_start_time >= BLINK_DURATION:
-                        blinking = False
-                        blink_start_time = None
+                cv2.putText(frame, "Eyes Open", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                if blinking and time.time() - blink_start_time >= BLINK_DURATION:
+                    blinking = False
+                    blink_start_time = None
                 if not blinking:
-                    color = (0, 255, 0)  # verde
+                    color = (0, 255, 0)
 
-            cv2.circle(frame, (pred_x, pred_y), 20, color, -1)
+            cv2.circle(frame, (int(pred_x), int(pred_y)), 20, color, -1)
 
     draw_button(frame, "Olho Esquerdo", (WIDTH // 2 - 340, 20), active_eye == 0)
     draw_button(frame, "Olho Direito", (WIDTH // 2 - 100, 20), active_eye == 1)
@@ -227,8 +229,7 @@ while True:
                     model_trained = True
     else:
         if not model_trained:
-            cv2.putText(frame, "Pressione 'c' para iniciar calibração",
-                        (20, HEIGHT - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(frame, "Pressione 'c' para iniciar calibração", (20, HEIGHT - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
     cv2.imshow("Gaze Calibration", frame)
 
